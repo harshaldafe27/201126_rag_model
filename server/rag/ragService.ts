@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type, type Schema } from '@google/genai';
 import { extractDocumentContent } from '../extractors.ts';
 import { formatApiError } from '../gemini.ts';
 import { chunkDocumentSegments } from './chunker.ts';
@@ -21,7 +21,7 @@ import type {
   StructuredRagAnswer,
   WorkspaceDocumentRecord,
 } from './types.ts';
-import { validateUploadedFile } from './validation.ts';
+import { DocumentValidationError, validateUploadedFile } from './validation.ts';
 import {
   deleteDocumentVectors,
   getChunksForDocuments,
@@ -38,7 +38,9 @@ import {
   saveWorkspaceDocument,
 } from './workspaceStore.ts';
 
-const GENERATION_MODEL = 'gemini-4-hydrogen';
+const PRIMARY_GENERATION_MODEL = 'gemini-4-hydrogen';
+const FALLBACK_GENERATION_MODEL = 'gemini-3.1-flash-lite';
+const GENERATION_ATTEMPT_TIMEOUT_MS = 18_000;
 const logger = createLogger('RagService');
 
 function getGeminiClient(): GoogleGenAI {
@@ -56,6 +58,101 @@ function getGeminiClient(): GoogleGenAI {
       },
     },
   });
+}
+
+function isTransientGeminiError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes('503') ||
+    msg.includes('unavailable') ||
+    msg.includes('high demand') ||
+    msg.includes('overloaded') ||
+    msg.includes('429') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('timed out') ||
+    msg.includes('deadline') ||
+    msg.includes('econnreset') ||
+    msg.includes('fetch failed')
+  );
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function generateStructuredJsonWithResilience(params: {
+  contents: string;
+  systemInstruction: string;
+  responseSchema: Schema;
+}): Promise<string> {
+  const ai = getGeminiClient();
+  const attemptPlan = [
+    { model: PRIMARY_GENERATION_MODEL, thinkingLevel: ThinkingLevel.LOW, backoffMs: 0 },
+    { model: FALLBACK_GENERATION_MODEL, thinkingLevel: ThinkingLevel.LOW, backoffMs: 400 },
+    { model: FALLBACK_GENERATION_MODEL, thinkingLevel: ThinkingLevel.MINIMAL, backoffMs: 1200 },
+  ];
+
+  let lastError: unknown;
+
+  for (let i = 0; i < attemptPlan.length; i++) {
+    const plan = attemptPlan[i];
+    if (plan.backoffMs > 0) {
+      await sleep(plan.backoffMs);
+    }
+
+    try {
+      const response = await withTimeout(
+        ai.models.generateContent({
+          model: plan.model,
+          contents: params.contents,
+          config: {
+            systemInstruction: params.systemInstruction,
+            thinkingConfig: { thinkingLevel: plan.thinkingLevel },
+            responseMimeType: 'application/json',
+            responseSchema: params.responseSchema,
+          },
+        }),
+        GENERATION_ATTEMPT_TIMEOUT_MS,
+        `Gemini ${plan.model}`
+      );
+
+      const text = (response.text ?? '{}').trim();
+      if (!text) {
+        throw new Error(`Empty JSON response from ${plan.model}`);
+      }
+      return text;
+    } catch (err) {
+      lastError = err;
+      const hasNext = i < attemptPlan.length - 1;
+      if (hasNext && isTransientGeminiError(err)) {
+        logger.info('Retrying Gemini generation after transient upstream demand/latency', {
+          attempt: i + 1,
+          model: plan.model,
+          nextModel: attemptPlan[i + 1].model,
+        });
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw lastError ?? new Error('AI model generation failed after retries.');
 }
 
 function createDocId(): string {
@@ -95,7 +192,10 @@ async function runExtractionChunkingEmbedding(params: {
     });
 
     if (chunks.length === 0) {
-      throw new Error('No indexable text chunks could be created from this document.');
+      throw new DocumentValidationError(
+        'No indexable text chunks could be created from this document.',
+        422
+      );
     }
 
     // Stage 3: Generate dense embeddings with gemini-embedding-2
@@ -133,19 +233,28 @@ async function runExtractionChunkingEmbedding(params: {
 
     return readyRecord;
   } catch (err) {
-    const { message } = formatApiError(err);
+    const { status, message } = formatApiError(err);
     const failedRecord: WorkspaceDocumentRecord = {
       ...current,
       status: 'error',
       errorMessage: message,
     };
     await saveWorkspaceDocument(workspaceId, failedRecord);
-    logger.error('Document ingestion failed', {
-      workspaceId,
-      documentId: current.id,
-      error: message,
-    });
-    throw new Error(message);
+    if (status >= 500) {
+      logger.error('Document ingestion failed', {
+        workspaceId,
+        documentId: current.id,
+        error: message,
+      });
+    } else {
+      logger.info('Document ingestion rejected', {
+        workspaceId,
+        documentId: current.id,
+        status,
+        reason: message,
+      });
+    }
+    throw err instanceof DocumentValidationError ? err : new Error(message);
   }
 }
 
@@ -244,15 +353,16 @@ export async function reindexWorkspaceDocument(
 ): Promise<WorkspaceDocumentRecord> {
   const existing = await getWorkspaceDocument(workspaceId, documentId);
   if (!existing) {
-    throw new Error('Document not found in this workspace.');
+    throw new DocumentValidationError('Document not found in this workspace.', 404);
   }
 
   let buffer: Buffer;
   try {
     buffer = await readOriginalDocumentFile(workspaceId, existing.storedFileName);
   } catch {
-    throw new Error(
-      `Original file for "${existing.name}" is no longer available on disk. Please upload the file again.`
+    throw new DocumentValidationError(
+      `Original file for "${existing.name}" is no longer available on disk. Please upload the file again.`,
+      404
     );
   }
 
@@ -314,7 +424,10 @@ export async function answerQuestionWithRag(params: {
   );
 
   if (selectedDocs.length === 0) {
-    throw new Error('Please select at least one indexed document before asking a question.');
+    throw new DocumentValidationError(
+      'Please select at least one indexed document before asking a question.',
+      400
+    );
   }
 
   const checkedDocuments = selectedDocs.map((d) => d.name);
@@ -354,7 +467,6 @@ export async function answerQuestionWithRag(params: {
   }
 
   // Step 4: Grounded Gemini Integration — strictly answer from retrieved chunks
-  const ai = getGeminiClient();
   const contextBlock = buildRetrievedContextPrompt(searchResult.matches);
   const recentHistory = history
     .slice(-6)
@@ -391,86 +503,82 @@ ABSOLUTE GROUNDING RULES:
     recentHistory ? `Recent Conversation History:\n${recentHistory}\n\n` : ''
   }Retrieved Document Chunks:\n${contextBlock}\n\nStudent Question:\n${question}`;
 
-  const response = await ai.models.generateContent({
-    model: GENERATION_MODEL,
+  const responseText = await generateStructuredJsonWithResilience({
     contents: userPrompt,
-    config: {
-      systemInstruction,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          isSupported: { type: Type.BOOLEAN },
-          evidenceStatus: {
-            type: Type.STRING,
-            description: 'One of "strong", "moderate", or "insufficient".',
+    systemInstruction,
+    responseSchema: {
+      type: Type.OBJECT,
+      properties: {
+        isSupported: { type: Type.BOOLEAN },
+        evidenceStatus: {
+          type: Type.STRING,
+          description: 'One of "strong", "moderate", or "insufficient".',
+        },
+        directAnswer: { type: Type.STRING },
+        missingInformation: { type: Type.STRING },
+        explanation: { type: Type.STRING },
+        hasNumericalSolution: { type: Type.BOOLEAN },
+        numericalSolution: {
+          type: Type.OBJECT,
+          properties: {
+            formula: { type: Type.STRING },
+            inputValues: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  symbol: { type: Type.STRING },
+                  value: { type: Type.STRING },
+                  unit: { type: Type.STRING },
+                },
+                required: ['symbol', 'value'],
+              },
+            },
+            steps: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  stepNumber: { type: Type.INTEGER },
+                  title: { type: Type.STRING },
+                  expression: { type: Type.STRING },
+                  detail: { type: Type.STRING },
+                },
+                required: ['stepNumber', 'title', 'detail'],
+              },
+            },
+            finalAnswer: { type: Type.STRING },
+            sourceChunkId: { type: Type.STRING },
           },
-          directAnswer: { type: Type.STRING },
-          missingInformation: { type: Type.STRING },
-          explanation: { type: Type.STRING },
-          hasNumericalSolution: { type: Type.BOOLEAN },
-          numericalSolution: {
+          required: ['formula', 'inputValues', 'steps', 'finalAnswer'],
+        },
+        citations: {
+          type: Type.ARRAY,
+          items: {
             type: Type.OBJECT,
             properties: {
-              formula: { type: Type.STRING },
-              inputValues: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    symbol: { type: Type.STRING },
-                    value: { type: Type.STRING },
-                    unit: { type: Type.STRING },
-                  },
-                  required: ['symbol', 'value'],
-                },
-              },
-              steps: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    stepNumber: { type: Type.INTEGER },
-                    title: { type: Type.STRING },
-                    expression: { type: Type.STRING },
-                    detail: { type: Type.STRING },
-                  },
-                  required: ['stepNumber', 'title', 'detail'],
-                },
-              },
-              finalAnswer: { type: Type.STRING },
-              sourceChunkId: { type: Type.STRING },
+              chunkId: { type: Type.STRING },
+              documentName: { type: Type.STRING },
+              pageOrSection: { type: Type.STRING },
+              supportingPassage: { type: Type.STRING },
             },
-            required: ['formula', 'inputValues', 'steps', 'finalAnswer'],
-          },
-          citations: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                chunkId: { type: Type.STRING },
-                documentName: { type: Type.STRING },
-                pageOrSection: { type: Type.STRING },
-                supportingPassage: { type: Type.STRING },
-              },
-              required: ['chunkId', 'documentName', 'pageOrSection', 'supportingPassage'],
-            },
+            required: ['chunkId', 'documentName', 'pageOrSection', 'supportingPassage'],
           },
         },
-        required: [
-          'isSupported',
-          'evidenceStatus',
-          'directAnswer',
-          'missingInformation',
-          'explanation',
-          'hasNumericalSolution',
-          'citations',
-        ],
       },
+      required: [
+        'isSupported',
+        'evidenceStatus',
+        'directAnswer',
+        'missingInformation',
+        'explanation',
+        'hasNumericalSolution',
+        'citations',
+      ],
     },
   });
 
-  const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+  const parsed = JSON.parse(responseText) as {
     isSupported: boolean;
     evidenceStatus?: string;
     directAnswer: string;
@@ -520,7 +628,7 @@ ABSOLUTE GROUNDING RULES:
 
   // Enforce zero-fabrication invariant: if no valid citation maps to retrieved chunks, refuse!
   if (validatedCitations.length === 0) {
-    logger.warn('Response rejected by citation validator (0 verified citations)', {
+    logger.info('Response refused by citation validator (0 verified citations)', {
       workspaceId,
       question: question.slice(0, 80),
     });
@@ -631,7 +739,10 @@ export async function generateQuizWithRag(params: {
   );
 
   if (selectedDocs.length === 0) {
-    throw new Error('Please select at least one indexed document to generate a practice quiz.');
+    throw new DocumentValidationError(
+      'Please select at least one indexed document to generate a practice quiz.',
+      400
+    );
   }
 
   let candidateChunks: DocumentChunk[];
@@ -675,72 +786,67 @@ export async function generateQuizWithRag(params: {
     )
     .join('\n\n');
 
-  const ai = getGeminiClient();
-  const response = await ai.models.generateContent({
-    model: GENERATION_MODEL,
+  const quizResponseText = await generateStructuredJsonWithResilience({
     contents: `Indexed Study Chunks:\n${chunkBlock}\n\nGenerate a ${count}-question ${difficulty} practice quiz${
       topicFocus?.trim() ? ` focusing on "${topicFocus.trim()}"` : ''
     }.`,
-    config: {
-      systemInstruction: `You are .Aai ("The teacher, understand you"), generating a practice quiz STRICTLY grounded in the supplied indexed chunks.
+    systemInstruction: `You are .Aai ("The teacher, understand you"), generating a practice quiz STRICTLY grounded in the supplied indexed chunks.
 Every question MUST reference a real CHUNK_ID from the supplied chunks, provide 4 answer choices with 1 unambiguous correctOptionIndex (0-3), include clear explanations and calculationSteps for numerical problems, and quote a verbatim supportingPassage from that chunk.`,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          title: { type: Type.STRING },
-          questions: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                question: { type: Type.STRING },
-                type: { type: Type.STRING },
-                options: { type: Type.ARRAY, items: { type: Type.STRING } },
-                correctOptionIndex: { type: Type.INTEGER },
-                explanation: { type: Type.STRING },
-                calculationSteps: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      stepNumber: { type: Type.INTEGER },
-                      title: { type: Type.STRING },
-                      expression: { type: Type.STRING },
-                      detail: { type: Type.STRING },
-                    },
-                    required: ['stepNumber', 'title', 'detail'],
-                  },
-                },
-                citation: {
+    responseSchema: {
+      type: Type.OBJECT,
+      properties: {
+        title: { type: Type.STRING },
+        questions: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              question: { type: Type.STRING },
+              type: { type: Type.STRING },
+              options: { type: Type.ARRAY, items: { type: Type.STRING } },
+              correctOptionIndex: { type: Type.INTEGER },
+              explanation: { type: Type.STRING },
+              calculationSteps: {
+                type: Type.ARRAY,
+                items: {
                   type: Type.OBJECT,
                   properties: {
-                    chunkId: { type: Type.STRING },
-                    documentName: { type: Type.STRING },
-                    pageOrSection: { type: Type.STRING },
-                    supportingPassage: { type: Type.STRING },
+                    stepNumber: { type: Type.INTEGER },
+                    title: { type: Type.STRING },
+                    expression: { type: Type.STRING },
+                    detail: { type: Type.STRING },
                   },
-                  required: ['chunkId', 'documentName', 'pageOrSection', 'supportingPassage'],
+                  required: ['stepNumber', 'title', 'detail'],
                 },
               },
-              required: [
-                'question',
-                'type',
-                'options',
-                'correctOptionIndex',
-                'explanation',
-                'calculationSteps',
-                'citation',
-              ],
+              citation: {
+                type: Type.OBJECT,
+                properties: {
+                  chunkId: { type: Type.STRING },
+                  documentName: { type: Type.STRING },
+                  pageOrSection: { type: Type.STRING },
+                  supportingPassage: { type: Type.STRING },
+                },
+                required: ['chunkId', 'documentName', 'pageOrSection', 'supportingPassage'],
+              },
             },
+            required: [
+              'question',
+              'type',
+              'options',
+              'correctOptionIndex',
+              'explanation',
+              'calculationSteps',
+              'citation',
+            ],
           },
         },
-        required: ['title', 'questions'],
       },
+      required: ['title', 'questions'],
     },
   });
 
-  const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+  const parsed = JSON.parse(quizResponseText) as {
     title?: string;
     questions?: Array<{
       question: string;

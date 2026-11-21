@@ -51,10 +51,13 @@ async function embedSingleWithRetry(text: string, attempt = 1): Promise<number[]
       msg.includes('429') ||
       msg.includes('temporarily') ||
       msg.includes('timeout') ||
-      msg.includes('503');
+      msg.includes('503') ||
+      msg.includes('unavailable') ||
+      msg.includes('overloaded') ||
+      msg.includes('high demand');
     if (retryable && attempt < 3) {
       const waitMs = attempt * 750;
-      logger.warn('Transient embedding error, retrying chunk', { attempt, waitMs });
+      logger.info('Retrying embedding after transient upstream error', { attempt, waitMs });
       await new Promise((r) => setTimeout(r, waitMs));
       return embedSingleWithRetry(text, attempt + 1);
     }

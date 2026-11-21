@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
 const MODEL_NAME = 'gemini-4-hydrogen';
 
@@ -42,6 +42,17 @@ export interface HistoryTurn {
 }
 
 export function formatApiError(err: unknown): { status: number; message: string } {
+  if (
+    err &&
+    typeof err === 'object' &&
+    'statusCode' in err &&
+    typeof (err as { statusCode?: unknown }).statusCode === 'number'
+  ) {
+    const statusCode = (err as { statusCode: number }).statusCode;
+    const msg = err instanceof Error ? err.message : String(err);
+    return { status: statusCode, message: msg };
+  }
+
   const raw = err instanceof Error ? err.message : String(err);
   const lower = raw.toLowerCase();
 
@@ -57,6 +68,19 @@ export function formatApiError(err: unknown): { status: number; message: string 
       status: 429,
       message:
         'The AI service is temporarily rate-limited. Please wait a moment and try again.',
+    };
+  }
+  if (
+    lower.includes('503') ||
+    lower.includes('unavailable') ||
+    lower.includes('high demand') ||
+    lower.includes('overloaded') ||
+    lower.includes('timed out')
+  ) {
+    return {
+      status: 503,
+      message:
+        'The AI model is experiencing a temporary spike in demand. Please try again in a few seconds.',
     };
   }
   if (lower.includes('not_found') || lower.includes('404')) {
@@ -129,6 +153,7 @@ export async function extractScannedPdfWithGemini(
       ],
     },
     config: {
+      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
       responseMimeType: 'application/json',
       responseSchema: {
         type: Type.OBJECT,

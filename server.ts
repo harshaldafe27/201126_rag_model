@@ -66,7 +66,7 @@ function getRawWorkspaceId(req: Request): string | undefined {
 function requireWorkspace(req: Request, res: Response, next: NextFunction) {
   const raw = getRawWorkspaceId(req);
   if (!isValidWorkspaceId(raw)) {
-    logger.warn('Rejected unauthorized API request with missing/invalid workspace token', {
+    logger.info('Rejected unauthorized API request with missing/invalid workspace token', {
       path: req.path,
       method: req.method,
     });
@@ -153,8 +153,17 @@ async function createServer() {
         res.status(201).json({ document: result.document });
       } catch (ingestErr) {
         const { status, message } = formatApiError(ingestErr);
-        logger.error('Upload/ingestion error', { workspaceId, error: message });
-        res.status(status >= 400 && status < 500 ? status : 422).json({ error: message });
+        const responseStatus = status >= 400 && status < 500 ? status : 422;
+        if (status >= 500) {
+          logger.error('Upload/ingestion server error', { workspaceId, error: message });
+        } else {
+          logger.info('Upload validation rejected', {
+            workspaceId,
+            status: responseStatus,
+            reason: message,
+          });
+        }
+        res.status(responseStatus).json({ error: message });
       }
     });
   });
@@ -295,7 +304,11 @@ async function createServer() {
       res.json({ answer });
     } catch (err) {
       const { status, message } = formatApiError(err);
-      logger.error('RAG ask error', { error: message });
+      if (status >= 500) {
+        logger.error('RAG ask error', { status, error: message });
+      } else {
+        logger.info('RAG ask rejected', { status, reason: message });
+      }
       res.status(status).json({ error: message });
     }
   });
@@ -332,7 +345,11 @@ async function createServer() {
       res.json({ quiz });
     } catch (err) {
       const { status, message } = formatApiError(err);
-      logger.error('RAG quiz error', { error: message });
+      if (status >= 500) {
+        logger.error('RAG quiz error', { status, error: message });
+      } else {
+        logger.info('RAG quiz rejected', { status, reason: message });
+      }
       res.status(status).json({ error: message });
     }
   });

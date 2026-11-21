@@ -31,6 +31,16 @@ const ALLOWED_MIMES_BY_EXT: Record<string, Set<string>> = {
   ]),
 };
 
+export class DocumentValidationError extends Error {
+  readonly statusCode: number;
+
+  constructor(message: string, statusCode = 422) {
+    super(message);
+    this.name = 'DocumentValidationError';
+    this.statusCode = statusCode;
+  }
+}
+
 export interface ValidatedFileInfo {
   format: SupportedFormat;
   extension: string;
@@ -94,45 +104,53 @@ export async function validateUploadedFile(params: {
   const { originalName, mimeType, buffer } = params;
 
   if (!originalName || !originalName.trim()) {
-    throw new Error('Uploaded file must have a valid filename.');
+    throw new DocumentValidationError('Uploaded file must have a valid filename.', 400);
   }
 
   const ext = originalName.split('.').pop()?.toLowerCase() ?? '';
   if (!ALLOWED_EXTENSIONS.has(ext)) {
-    throw new Error(
-      `Unsupported file extension ".${ext || 'unknown'}". Only PDF, DOC, DOCX, PPT, and PPTX files are allowed.`
+    throw new DocumentValidationError(
+      `Unsupported file extension ".${ext || 'unknown'}". Only PDF, DOC, DOCX, PPT, and PPTX files are allowed.`,
+      400
     );
   }
 
   if (!buffer || buffer.length === 0) {
-    throw new Error(`"${originalName}" is empty (0 bytes) and cannot be indexed.`);
+    throw new DocumentValidationError(
+      `"${originalName}" is empty (0 bytes) and cannot be indexed.`,
+      422
+    );
   }
 
   if (buffer.length > MAX_UPLOAD_BYTES) {
-    throw new Error(
-      `"${originalName}" exceeds the maximum allowed size of 10 MB.`
+    throw new DocumentValidationError(
+      `"${originalName}" exceeds the maximum allowed size of 10 MB.`,
+      413
     );
   }
 
   const normalizedMime = (mimeType || 'application/octet-stream').toLowerCase().split(';')[0].trim();
   const allowedMimes = ALLOWED_MIMES_BY_EXT[ext];
   if (normalizedMime && allowedMimes && !allowedMimes.has(normalizedMime)) {
-    throw new Error(
-      `File MIME type "${normalizedMime}" does not match the ".${ext.toUpperCase()}" format.`
+    throw new DocumentValidationError(
+      `File MIME type "${normalizedMime}" does not match the ".${ext.toUpperCase()}" format.`,
+      422
     );
   }
 
   // Validate binary file signatures (magic bytes & container structure)
   if (ext === 'pdf') {
     if (!hasPdfSignature(buffer)) {
-      throw new Error(
-        `"${originalName}" does not contain a valid PDF file header. Please upload an authentic PDF document.`
+      throw new DocumentValidationError(
+        `"${originalName}" does not contain a valid PDF file header. Please upload an authentic PDF document.`,
+        422
       );
     }
   } else if (ext === 'docx' || ext === 'pptx') {
     if (!hasZipSignature(buffer)) {
-      throw new Error(
-        `"${originalName}" is not a valid ${ext.toUpperCase()} OpenXML archive.`
+      throw new DocumentValidationError(
+        `"${originalName}" is not a valid ${ext.toUpperCase()} OpenXML archive.`,
+        422
       );
     }
     try {
@@ -140,26 +158,31 @@ export async function validateUploadedFile(params: {
       const hasMarker =
         ext === 'docx'
           ? Boolean(zip.files['word/document.xml'])
-          : Object.keys(zip.files).some((k) => /^ppt\/slides\/slide\d+\.xml$/i.test(k) || k === 'ppt/presentation.xml');
+          : Object.keys(zip.files).some(
+              (k) => /^ppt\/slides\/slide\d+\.xml$/i.test(k) || k === 'ppt/presentation.xml'
+            );
       if (!hasMarker) {
-        throw new Error(
-          `"${originalName}" is missing required internal ${ext.toUpperCase()} document content.`
+        throw new DocumentValidationError(
+          `"${originalName}" is missing required internal ${ext.toUpperCase()} document content.`,
+          422
         );
       }
     } catch (zipErr) {
-      if (zipErr instanceof Error && zipErr.message.includes('missing required internal')) {
+      if (zipErr instanceof DocumentValidationError) {
         throw zipErr;
       }
-      throw new Error(
-        `"${originalName}" appears corrupted and could not be opened as a valid ${ext.toUpperCase()} file.`
+      throw new DocumentValidationError(
+        `"${originalName}" appears corrupted and could not be opened as a valid ${ext.toUpperCase()} file.`,
+        422
       );
     }
   } else if (ext === 'doc' || ext === 'ppt') {
     // Legacy Office files are OLE2 Compound Binary Files (occasionally RTF for .doc)
     const isRtfDoc = ext === 'doc' && buffer.subarray(0, 5).toString('latin1') === '{\\rtf';
     if (!hasOle2Signature(buffer) && !isRtfDoc) {
-      throw new Error(
-        `"${originalName}" does not have a valid legacy ${ext.toUpperCase()} binary signature.`
+      throw new DocumentValidationError(
+        `"${originalName}" does not have a valid legacy ${ext.toUpperCase()} binary signature.`,
+        422
       );
     }
   }
